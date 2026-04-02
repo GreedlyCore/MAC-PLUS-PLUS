@@ -1548,7 +1548,18 @@ bool registration(const string &name, const string &src_pointcloud, const string
     }
 }
 
+#ifndef MACPP_PYBIND
 int main(int argc, char** argv){
+    if (argc < 10) {
+        cerr << "[error] Invalid arguments for MAC solver." << endl;
+        if (argc >= 2 && string(argv[1]) == "--demo") {
+            cerr << "[hint] --demo is handled by Boot, not MAC." << endl;
+            cerr << "[hint] Run: ./Boot --demo" << endl;
+        }
+        cerr << "Usage: MAC <datasetName> <src_cloud> <tgt_cloud> <corr_path> <gt_label_path> <gt_mat_path> <ov_label> <folderPath> <descriptor>" << endl;
+        return -1;
+    }
+
     string datasetName(argv[1]);
     string src_cloud(argv[2]);
     string tgt_cloud(argv[3]);
@@ -1592,3 +1603,4 @@ int main(int argc, char** argv){
         out.close();
     }
 }
+#endif

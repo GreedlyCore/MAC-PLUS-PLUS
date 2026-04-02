@@ -5,6 +5,7 @@
 #include <cstdlib>     // 包含exit()函数
 #include <getopt.h>
 #include <unistd.h>
+#include <limits.h>
 #include <iomanip>  // 添加此头文件以使用 setprecision
 #include <fstream>  // 添加此头文件以使用 ifstream
 
@@ -16,6 +17,59 @@ bool low_inlieratio;
 bool no_logs;
 
 string program_name = "./MAC";
+
+string shell_quote(const string& s) {
+    return "\"" + s + "\"";
+}
+
+string dirname_of(const string& path) {
+    size_t pos = path.find_last_of('/');
+    if (pos == string::npos) {
+        return ".";
+    }
+    if (pos == 0) {
+        return "/";
+    }
+    return path.substr(0, pos);
+}
+
+string get_executable_dir() {
+    char exe_path[PATH_MAX];
+    ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
+    if (len <= 0) {
+        return ".";
+    }
+    exe_path[len] = '\0';
+    return dirname_of(string(exe_path));
+}
+
+string resolve_mac_binary() {
+    const string exe_dir = get_executable_dir();
+    const string mac_near_boot = exe_dir + "/MAC";
+    if (access(mac_near_boot.c_str(), X_OK) == 0) {
+        return mac_near_boot;
+    }
+    if (access("./MAC", X_OK) == 0) {
+        return "./MAC";
+    }
+    return "MAC";
+}
+
+string resolve_demo_dir() {
+    const string exe_dir = get_executable_dir();
+    const string candidates[] = {
+        exe_dir + "/../../demo",
+        exe_dir + "/../demo",
+        exe_dir + "/demo",
+        "demo"
+    };
+    for (const auto& dir : candidates) {
+        if (access((dir + "/corr.txt").c_str(), F_OK) == 0 && access((dir + "/GTmat.txt").c_str(), F_OK) == 0) {
+            return dir;
+        }
+    }
+    return "";
+}
 
 string threeDMatch[8] = {
         "7-scenes-redkitchen",
@@ -118,7 +172,7 @@ vector<string> analyse(const string& name, const string& result_scene, const str
         //float re, te;
         //double inlier_num, total_num, inlier_ratio, success_estimate, total_estimate;
         //int corrected = registration(name, src_filename, des_filename, corr_path, gt_label, ov_label, gt_mat_path, result_folder, re, te, inlier_num, total_num, inlier_ratio, success_estimate, total_estimate, descriptor, time, clique_size);
-        string cmd = program_name + " " + name + " " + src_filename + " " + des_filename + " " + corr_path + " " + gt_label + " " + gt_mat_path + " " + ov_label + " " + result_folder +  " " + descriptor;
+        string cmd = shell_quote(program_name) + " " + name + " " + shell_quote(src_filename) + " " + shell_quote(des_filename) + " " + shell_quote(corr_path) + " " + shell_quote(gt_label) + " " + shell_quote(gt_mat_path) + " " + ov_label + " " + shell_quote(result_folder) + " " + descriptor;
         system(cmd.c_str());
 
         double re=0, te=0;
@@ -163,16 +217,22 @@ vector<string> analyse(const string& name, const string& result_scene, const str
 }
 
 void demo(){
+    string demo_dir = resolve_demo_dir();
+    if (demo_dir.empty()) {
+        cerr << "Could not locate demo data directory. Expected demo files near Boot binary or current working directory." << endl;
+        return;
+    }
+
     string datasetName = "3dmatch";
-    string src_filename = "demo/src.ply";
-    string des_filename = "demo/tgt.ply";
-    string corr_path = "demo/corr.txt";
-    string gt_label_path = "demo/label.txt";
+    string src_filename = demo_dir + "/src.ply";
+    string des_filename = demo_dir + "/tgt.ply";
+    string corr_path = demo_dir + "/corr.txt";
+    string gt_label_path = demo_dir + "/label.txt";
     string descriptor = "fpfh";
-    string gt_mat_path = "demo/GTmat.txt";
+    string gt_mat_path = demo_dir + "/GTmat.txt";
     string ov_label = "NULL";
-    string result_folder = "demo/result";
-    string cmd = program_name + " " + datasetName + " " + src_filename + " " + des_filename + " " + corr_path + " " + gt_label_path + " " + gt_mat_path + " " + ov_label + " " + result_folder +  " " + descriptor;
+    string result_folder = demo_dir + "/result";
+    string cmd = shell_quote(program_name) + " " + datasetName + " " + shell_quote(src_filename) + " " + shell_quote(des_filename) + " " + shell_quote(corr_path) + " " + shell_quote(gt_label_path) + " " + shell_quote(gt_mat_path) + " " + ov_label + " " + shell_quote(result_folder) + " " + descriptor;
     cout << cmd << endl;
     system(cmd.c_str());
 }
@@ -193,6 +253,7 @@ void usage(){
 
 int main(int argc, char** argv) {
     //////////////////////////////////////////////////////////////////
+    program_name = resolve_mac_binary();
     add_overlap = false;
     low_inlieratio = false;
     no_logs = false;
@@ -569,7 +630,7 @@ int main(int argc, char** argv) {
             double re, te;
             double inlier_ratio, success_estimate, total_estimate;
 
-            string cmd = program_name + " " + datasetName + " " + src_filename + " " + des_filename + " " + corr_path + " " + gt_label_path + " " + gt_mat_path + " " + ov_label + " " + folderPath +  " " + descriptor;
+            string cmd = shell_quote(program_name) + " " + datasetName + " " + src_filename + " " + des_filename + " " + shell_quote(corr_path) + " " + shell_quote(gt_label_path) + " " + shell_quote(gt_mat_path) + " " + ov_label + " " + shell_quote(folderPath) + " " + descriptor;
             system(cmd.c_str());
 
             int inlier_num =0 , total_num  =0;
