@@ -119,7 +119,7 @@ Eigen::MatrixXf Graph_construction(vector<Corre_3DMatch>& correspondence, float 
 			for (int j = i + 1; j < size; j++)
 			{
 				c2 = correspondence[j];
-				//计算兼容性分数
+				//Calculate compatibility score
 				src_dis = Distance(c1.src, c2.src);
 				des_dis = Distance(c1.des, c2.des);
 				dis = abs(src_dis - des_dis);
@@ -183,30 +183,30 @@ void weight_SVD(PointCloudPtr& src_pts, PointCloudPtr& des_pts, Eigen::VectorXf&
 	{
 		weights(i) = (weights(i) < weight_threshold) ? 0 : weights(i);
 	}
-	//weights升维度
+    //Expand weights to a matrix.
 	Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic> weight;
 	Eigen::VectorXf ones = weights;
 	ones.setOnes();
 	weight = (weights * ones.transpose());
 	Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic> Identity = weight;
-	//构建对角阵
+    //Build the diagonal matrix.
 	Identity.setIdentity();
 	weight = (weights * ones.transpose()).cwiseProduct(Identity);
 	pcl::ConstCloudIterator<pcl::PointXYZ> src_it(*src_pts);
 	pcl::ConstCloudIterator<pcl::PointXYZ> des_it(*des_pts);
-	//获取点云质心
+    //Compute the point cloud centroids.
 	src_it.reset(); des_it.reset();
 	Eigen::Matrix<float, 4, 1> centroid_src, centroid_des;
 	pcl::compute3DCentroid(src_it, centroid_src);
 	pcl::compute3DCentroid(des_it, centroid_des);
 
-	//去除点云质心
+    //Center the point clouds by subtracting the centroids.
 	src_it.reset(); des_it.reset();
 	Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic> src_demean, des_demean;
 	pcl::demeanPointCloud(src_it, centroid_src, src_demean);
 	pcl::demeanPointCloud(des_it, centroid_des, des_demean);
 
-	//计算加权协方差矩阵
+    //Compute the weighted covariance matrix.
 	Eigen::Matrix<float, 3, 3> H = (src_demean * weight * des_demean.transpose()).topLeftCorner(3, 3);
 	//cout << H << endl;
 
@@ -222,7 +222,7 @@ void weight_SVD(PointCloudPtr& src_pts, PointCloudPtr& des_pts, Eigen::VectorXf&
 			v(x, 2) *= -1;
 	}
 
-	Eigen::Matrix<float, 3, 3> R = v * u.transpose(); //正交矩阵的乘积还是正交矩阵，因此R的逆等于R的转置
+    Eigen::Matrix<float, 3, 3> R = v * u.transpose(); //The product of orthogonal matrices is still orthogonal, so R inverse equals R transpose.
 
 	// Return the correct transformation
 	Eigen::Matrix<float, 4, 4> Trans;
@@ -233,7 +233,7 @@ void weight_SVD(PointCloudPtr& src_pts, PointCloudPtr& des_pts, Eigen::VectorXf&
 	trans_Mat = Trans;
 }
 
-void post_refinement(vector<Corre_3DMatch>&correspondence, PointCloudPtr& src_corr_pts, PointCloudPtr& des_corr_pts, Eigen::Matrix4f& initial/* 由最大团生成的变换 */, float& best_score, float inlier_thresh, int iterations, const string &metric) {
+void post_refinement(vector<Corre_3DMatch>&correspondence, PointCloudPtr& src_corr_pts, PointCloudPtr& des_corr_pts, Eigen::Matrix4f& initial/* Transformation generated from the maximal clique */, float& best_score, float inlier_thresh, int iterations, const string &metric) {
     int pointNum = src_corr_pts->points.size();
 	float pre_score = best_score;
 	for (int i = 0; i < iterations; i++)
@@ -281,7 +281,7 @@ void post_refinement(vector<Corre_3DMatch>&correspondence, PointCloudPtr& src_co
 		}
 		else {
 			pre_score = score;
-			//估计pred_inlier
+            //Estimate pred_inlier.
 			PointCloudPtr pred_src_pts(new pcl::PointCloud<pcl::PointXYZ>);
 			PointCloudPtr pred_des_pts(new pcl::PointCloud<pcl::PointXYZ>);
 			pcl::copyPointCloud(*src_corr_pts, pred_inlier_index, *pred_src_pts);
@@ -291,7 +291,6 @@ void post_refinement(vector<Corre_3DMatch>&correspondence, PointCloudPtr& src_co
 			{
 				weight_pred[k] = weights[pred_inlier_index[k]];
 			}
-			//weighted_svd
 			weight_SVD(pred_src_pts, pred_des_pts, weight_pred, 0, initial);
 			pred_src_pts.reset(new pcl::PointCloud<pcl::PointXYZ>);
 			pred_des_pts.reset(new pcl::PointCloud<pcl::PointXYZ>);
@@ -389,7 +388,7 @@ void find_clique_of_node2(Eigen::MatrixXf& Graph, igraph_vector_int_list_t* cliq
             avg_score += result[i].score;
         }
     }
-    sort(result.begin(), result.end(), compare_local_score); //所有节点从大到小排序
+    sort(result.begin(), result.end(), compare_local_score); //Sort all nodes in descending order.
 
     if( m <= n ){
         for(int i = 0; i < m; i++){
@@ -408,7 +407,7 @@ void find_clique_of_node2(Eigen::MatrixXf& Graph, igraph_vector_int_list_t* cliq
     int max_cnt = 10;  //default 10
     for(int i = 0; i < n; i++){
         if(result[i].score < avg_score) break;
-        sort(result[i].clique_ind_score.begin(), result[i].clique_ind_score.end(), compare_vote_score); //局部从大到小排序
+        sort(result[i].clique_ind_score.begin(), result[i].clique_ind_score.end(), compare_vote_score); //Sort locally in descending order.
         sampled_ind.push_back(result[i].corre_ind);
         int seleted_cnt = 1;
         for(int j = 0; j < result[i].clique_ind_score.size(); j++){
@@ -427,7 +426,7 @@ void find_clique_of_node2(Eigen::MatrixXf& Graph, igraph_vector_int_list_t* cliq
     return;
 }
 
-//保存数据,需要与寻找法向量部分组合
+//Save data; this needs to be combined with the normal estimation step.
 void savetxt(vector<Corre_3DMatch>corr, const string& save_path) {
 	ofstream outFile;
 	outFile.open(save_path.c_str(), ios::out);
@@ -473,7 +472,7 @@ int clusterTransformationByRotation(vector<Eigen::Matrix3f> &Rs, vector<Eigen::V
     for (size_t i = 0; i < num; i++) {
         Eigen::Transform<float, 3, Eigen::Affine> R(Rs[i]);
         pcl::getEulerAngles<float>(R, (*trans)[i].x, (*trans)[i].y, (*trans)[i].z);
-        // 去除无效解
+        //Remove invalid solutions.
         if(!checkEulerAngles((*trans)[i].x) || !checkEulerAngles((*trans)[i].y) || !checkEulerAngles((*trans)[i].z)){
             cout << "INVALID POINT" << endl;
             (*trans)[i].x = 666;
@@ -483,7 +482,7 @@ int clusterTransformationByRotation(vector<Eigen::Matrix3f> &Rs, vector<Eigen::V
             (*trans)[i].normal_y = 666;
             (*trans)[i].normal_z = 666;
         }
-        else{ // 需要解决同一个角度的正负问题 6.14   平面 y=PI 右侧的解（需要验证） 6.20
+        else{ //Handle the sign ambiguity for the same angle. 6.14  Plane y=PI uses the right-side solution (needs verification). 6.20
             (*trans)[i].x = ((*trans)[i].x < 0 && (*trans)[i].x >= -M_PIf32) ? (*trans)[i].x + 2*M_PIf32 : (*trans)[i].x;
             (*trans)[i].y = ((*trans)[i].y < 0 && (*trans)[i].y >= -M_PIf32) ? (*trans)[i].y + 2*M_PIf32 : (*trans)[i].y;
             (*trans)[i].z = ((*trans)[i].z < 0 && (*trans)[i].z >= -M_PIf32) ? (*trans)[i].z + 2*M_PIf32 : (*trans)[i].z;
@@ -520,7 +519,7 @@ float OAMAE_1tok(PointCloudPtr& raw_src, PointCloudPtr& raw_des, Eigen::Matrix4f
         float dis = 0.0;
         if(!pcl::isFinite(src_trans->points[src_ind])) continue;
         for(auto & e : des_ind){
-            //计算距离
+            //Calculate distance
             float distance = Distance(src_trans->points[src_ind], raw_des->points[e]);
             if (distance < thresh)
             {
@@ -545,7 +544,7 @@ float OAMAE(PointCloudPtr& raw_src, PointCloudPtr& raw_des, Eigen::Matrix4f &est
         float dis = 0.0;
         for(auto & e : src_ind){
             if(!pcl::isFinite(src_trans->points[e])) continue;
-            //计算距离
+            //Calculate distance
             float distance = Distance(src_trans->points[e], raw_des->points[des_ind]);
             if (distance < thresh)
             {
@@ -637,7 +636,7 @@ Eigen::Matrix4f clusterInternalTransEva(pcl::IndicesClusters &clusterTrans, int 
     //outfile << setprecision(4) << RE << " " << TE << " " << max_score << " "<< suc <<  endl;
     Eigen::Matrix4f est = initial;
 
-    //统计类内R T差异情况
+    //Compute the R/T differences inside the cluster.
     vector<pair<float, float>> RTdifference;
     float avg_Rdiff =0, avg_Tdiff =0;
     int n = 0;
@@ -658,7 +657,7 @@ Eigen::Matrix4f clusterInternalTransEva(pcl::IndicesClusters &clusterTrans, int 
     avg_Rdiff /= n;
 
     for(int i = 0; i < clusterTrans[best_index].indices.size(); i++){
-        //继续缩小解空间
+        //Keep shrinking the solution space.
         if(!isfinite(RTdifference[i].first) || !isfinite(RTdifference[i].second) || RTdifference[i].first > avg_Rdiff || RTdifference[i].second > avg_Tdiff) continue;
         //if(RTdifference[i].first > 5 || RTdifference[i].second > 10) continue;
         int ind = clusterTrans[best_index].indices[i];
@@ -703,7 +702,7 @@ Eigen::Matrix4f clusterInternalTransEva1(pcl::IndicesClusters &clusterTrans, int
     //outfile << setprecision(4) << RE << " " << TE << " " << max_score << " "<< suc <<  endl;
     Eigen::Matrix4f est = initial;
 
-    //统计类内R T差异情况
+    //Compute the R/T differences inside the cluster.
     vector<pair<float, float>> RTdifference;
     int n = 0;
     for(int i = 0; i < clusterTrans[best_index].indices.size(); i++){
@@ -714,11 +713,11 @@ Eigen::Matrix4f clusterInternalTransEva1(pcl::IndicesClusters &clusterTrans, int
         float T_diff = calculate_translation_error(T, T_initial);
         RTdifference.emplace_back(R_diff, T_diff);
     }
-    ///TODO RTdifference排序
+    ///TODO Sort RTdifference.
     sort(RTdifference.begin(), RTdifference.end());
     int i = 0, cnt = 10;
-    while(i < min(100, (int)clusterTrans[best_index].indices.size()) && cnt > 0){ ///TODO 第一个mat可能与initial一样
-        //继续缩小解空间
+    while(i < min(100, (int)clusterTrans[best_index].indices.size()) && cnt > 0){ ///TODO The first matrix may be the same as initial.
+        //Keep shrinking the solution space.
         if(!isfinite(RTdifference[i].first) || !isfinite(RTdifference[i].second)) {
             i++;
             continue;
@@ -753,7 +752,7 @@ Eigen::Matrix4f clusterInternalTransEva1(pcl::IndicesClusters &clusterTrans, int
     return est;
 }
 
-void make_des_src_pair(const vector<Corre_3DMatch>& correspondence, vector<pair<int, vector<int>>>& des_src){ //需要读取保存的kpts, 匹配数据按照索引形式保存
+void make_des_src_pair(const vector<Corre_3DMatch>& correspondence, vector<pair<int, vector<int>>>& des_src){ //Read the saved kpts; matching data is stored by index.
     assert(correspondence.size() > 1);
     des_src.clear();
     vector<Corre_3DMatch> corr;

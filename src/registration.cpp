@@ -26,7 +26,7 @@ using namespace std;
  bool low_inlieratio;
  bool no_logs;
 
-#define VMRSS_LINE 22 //VmRSS: 所在行数
+#define VMRSS_LINE 22 // VmRSS line index in /proc/<pid>/status
 #define PROCESS_ITEM 14
 double getPidMemory(unsigned int pid){
 
@@ -131,9 +131,9 @@ bool registration(const string &name, const string &src_pointcloud, const string
     int success_num = 0;
 
     cout << folderPath << endl;
-    // 获取数据文件目录
+    // Directory containing the correspondence file and related artifacts.
     string dataPath = corr_path.substr(0, corr_path.rfind("/"));
-    // 获取当前项目名称
+    // Item name inferred from the output folder.
     string item_name = folderPath.substr(folderPath.rfind("/") + 1, folderPath.length());
 
     vector<pair<int, vector<int>>> one2k_match;
@@ -187,7 +187,7 @@ bool registration(const string &name, const string &src_pointcloud, const string
     PointCloudPtr cloud_des(new pcl::PointCloud<pcl::PointXYZ>);
     PointCloudPtr cloud_src_kpts(new pcl::PointCloud<pcl::PointXYZ>);
     PointCloudPtr cloud_des_kpts(new pcl::PointCloud<pcl::PointXYZ>);
-    pcl::PointCloud<pcl::Normal>::Ptr normal_src(new pcl::PointCloud<pcl::Normal>);//法向量计算结果
+    pcl::PointCloud<pcl::Normal>::Ptr normal_src(new pcl::PointCloud<pcl::Normal>); // normal estimation output
     pcl::PointCloud<pcl::Normal>::Ptr normal_des(new pcl::PointCloud<pcl::Normal>);
     vector<Corre_3DMatch>correspondence;
     vector<int>true_corre;
@@ -500,7 +500,7 @@ bool registration(const string &name, const string &src_pointcloud, const string
         fclose(fp);
     }
 
-/**********************************不同数据集的阈值参数设置************************************/
+/********************************** Dataset-specific threshold setup ************************************/
     float RE_thresh, TE_thresh, inlier_thresh;
     if (name == "KITTI")
     {
@@ -522,7 +522,15 @@ bool registration(const string &name, const string &src_pointcloud, const string
     std::chrono::time_point<std::chrono::system_clock> start, end;
     std::chrono::duration<double> elapsed_time;
     time_number.clear();
-/********************************构图****************************************/
+
+/***==================== STAGE 1: COMPATIBILITY GRAPH CONSTRUCTION ====================***/
+/* Build First-Order Graph (FOG) and Second-Order Graph (SOG)
+   Eq. 13-15: Distance compatibility metric SC(c_k, c_l) = exp(-(S_dist)^2 / 2*sigma^2)
+   where S_dist(c_k, c_l) = ||p_i - p_m|| - ||q_j - q_n||
+   SOG strengthens edges by common neighbors: W_SOG = W_FOG ⊙ (W_FOG * W_FOG)
+   In this graph, true correspondences form dense subgraphs (cliques), outliers scatter weakly. */
+
+/***======================== Graph construction ================================***/
     start = std::chrono::system_clock::now();
     Eigen::MatrixXf Graph = Graph_construction(correspondence, resolution, sc2, name, descriptor, inlier_thresh);
     end = std::chrono::system_clock::now();
@@ -534,6 +542,13 @@ bool registration(const string &name, const string &src_pointcloud, const string
         cout << "Graph is disconnected. You may need to check the compatibility threshold!" << endl;
         return false;
     }
+
+/***===================== STAGE 2: VOTING-GUIDED NODE SELECTION =====================***/
+/* Eq. 16-17: Compute confidence weight for each vertex (correspondence)
+   w(CL_j) = sum of all edge weights in clique j  
+   w(v_i) = sum of weights of all cliques containing vertex v_i
+   Vertices with highest votes are selected as reliable seeds (trusted correspondences)
+   These seeds indicate overlap region and have high probability of being correct. */
 
     vector<int>degree(total_num, 0);
     vector<Vote_exp> pts_degree;
@@ -559,11 +574,17 @@ bool registration(const string &name, const string &src_pointcloud, const string
         pts_degree.push_back(t);
     }
 
-    //计算节点聚类系数，判断图是否密集，若密集则去除部分节点和边
+    // Compute local clustering coefficients for robustness ranking.
+    // If the graph is very dense, high-coefficient nodes/edges can be prioritized later.
     start = std::chrono::system_clock::now();
     vector<Vote> cluster_factor;
     float sum_fenzi = 0;
     float sum_fenmu = 0;
+
+/***======================== CLUSTERING COEFFICIENT COMPUTATION ========================***/
+/* Cluster coefficient measures local graph density around each vertex.
+   Identifies nodes with strong local consensus (surrounded by many compatible correspondences).
+   Used for adaptive threshold (OTSU) to filter weak compatibility edges. */
 
     for (int i = 0; i < total_num; i++)
     {
@@ -637,7 +658,7 @@ bool registration(const string &name, const string &src_pointcloud, const string
 
     cout << cluster_threshold << "->min(" << average_factor << " " << total_factor << " " << OTSU << ")" << endl;
     cout << " inliers: " << inlier_num << "\ttotal num: " << total_num << "\tinlier ratio: " << inlier_ratio*100 << "%" << endl;
-    //OTSU计算权重的阈值
+    // Weight threshold estimated by OTSU.
     float weight_thresh; //OTSU_thresh(sorted);
 
     if (add_overlap)
@@ -659,7 +680,7 @@ bool registration(const string &name, const string &src_pointcloud, const string
         weight_thresh = 0;
     }
 
-    //匹配置信度评分
+    // Assign per-correspondence confidence scores.
     if (!add_overlap || instance_equal)
     {
         for (size_t i = 0; i < total_num; i++)
@@ -668,12 +689,17 @@ bool registration(const string &name, const string &src_pointcloud, const string
         }
     }
 
-    /*****************************************调同igraph搜索团**************************************************/
+/***========== STAGE 3: MAXIMAL CLIQUES ENUMERATION (igraph Library) ==========***/
+/* Each maximal clique represents a locally consistent subset of correspondences.
+   A clique is a complete subgraph where all vertices are mutually connected.
+   These form the basis for hypothesis generation (one hypothesis per clique). */
+
+/******** Build igraph and search maximal cliques ********/
     igraph_t g;
     igraph_matrix_t g_mat;
     igraph_matrix_init(&g_mat, Graph.rows(), Graph.cols());
 
-    //减少图规模
+    // Reduce graph size for dense cases to keep clique search tractable.
     if (cluster_threshold > 2.9 && correspondence.size() > 50) // default 3 kitti-lc 2
     {
         float f = 10;
@@ -721,11 +747,21 @@ bool registration(const string &name, const string &src_pointcloud, const string
     igraph_vector_init(&weight, 0);
     igraph_weighted_adjacency(&g, &g_mat, IGRAPH_ADJ_UNDIRECTED, &weight, IGRAPH_LOOPS_ONCE);
 
+/***============== STAGE 3: MAXIMAL CLIQUES ENUMERATION ==============***/
+/* Find all maximal cliques: complete subgraphs where every pair of vertices is connected.
+   Each maximal clique represents locally consistent subset of correspondences.
+   Minimum clique size threshold controls quality vs. recall tradeoff:
+   - Higher threshold: fewer, more reliable cliques (fewer false positives)
+   - Lower threshold: more cliques but more noise (higher recall, lower precision) */
 
-    //找出所有最大团
+    // Enumerate all maximal cliques.
     igraph_vector_int_list_t cliques;
     igraph_vector_int_list_init(&cliques, 0);
     start = std::chrono::system_clock::now();
+
+/***==================== MAXIMAL CLIQUE ENUMERATION ====================***/
+/* Find all maximal cliques: complete subgraphs where every pair of vertices
+   is connected. Minimum size controls quality (higher = fewer but more reliable) */
 
     int min_clique_size = 3;
     if(kitti){
@@ -733,12 +769,12 @@ bool registration(const string &name, const string &src_pointcloud, const string
     }
     int max_clique_size = 0;
     bool recomputecliques = true;
-    int clique_num = 0; //默认无上限
+    int clique_num = 0; // no fixed cap by default
     int iter_num = 1;
 
-    //控制搜索到的数量
+    // Control clique count by adapting the minimum clique size.
     while(recomputecliques){
-        igraph_maximal_cliques(&g, &cliques, min_clique_size,  max_clique_size); //3dlomatch 3 3dmatch; 3 Kitti 4 (说明)
+        igraph_maximal_cliques(&g, &cliques, min_clique_size,  max_clique_size); // 3dmatch/3dlomatch: 3, KITTI: 4
         clique_num = igraph_vector_int_list_size(&cliques);
         if(clique_num > 10000000 && iter_num <= 5){
             max_clique_size = 15;
@@ -759,20 +795,25 @@ bool registration(const string &name, const string &src_pointcloud, const string
     time_number[1] = elapsed_time.count();
 
     if (clique_num == 0) {
-        //若搜索不到团，提示无法配准
+        // No clique found: registration cannot proceed.
         cout << " NO CLIQUES! " << endl;
         return false;
     }
     cout << " clique computation: " << elapsed_time.count() << endl;
 
-    //数据清理
+    // Cleanup graph memory before hypothesis generation.
     igraph_destroy(&g);
     igraph_matrix_destroy(&g_mat);
     start = std::chrono::system_clock::now();
 
-/*****************************************种子匹配生成以及团筛选**************************************************/
+/***============= STAGE 3B: VOTED MAXIMAL CLIQUE POOL (VMP) CONSTRUCTION =============***/
+/* Eq. 16-17: For each high-voted vertex (seed), collect K1 best cliques from its clique set.
+   Pool multiple cliques per vertex instead of just one (unlike basic MAC).
+   This preserves more correct hypotheses while maintaining computational tractability. */
+
+/********** Seed correspondence generation and clique filtering **********/
     vector<int>remain;
-    vector<int> sampled_ind; //排过序的
+    vector<int> sampled_ind; // sorted indices
     vector<Corre_3DMatch> sampled_corr;
     PointCloudPtr sampled_corr_src(new pcl::PointCloud<pcl::PointXYZ>);
     PointCloudPtr sampled_corr_des(new pcl::PointCloud<pcl::PointXYZ>);
@@ -787,7 +828,7 @@ bool registration(const string &name, const string &src_pointcloud, const string
             num++;
         }
     }
-   //注意这里的内点率要比初始匹配内点率高
+    // The inlier ratio here should be higher than the raw input correspondence ratio.
     cout << sampled_ind.size() << " sampled correspondences have " << num << " inlies: "<< num / ((int)sampled_ind.size() / 1.0) * 100 << "%" << endl;
 
     string sampled_corr_txt = folderPath + "/sampled_corr.txt";
@@ -825,7 +866,12 @@ bool registration(const string &name, const string &src_pointcloud, const string
         des_corr_pts->push_back(correspondence[i].des);
     }
 
-    /******************************************配准部分***************************************************/
+/***================= STAGE 4: POSE HYPOTHESIS GENERATION (SVD) =================***/
+/* For each clique C_j from VMP: collect correspondences {(p_i, q_j)} in clique
+   Estimate rotation R and translation t via weighted SVD:
+   min ||R*p_i + t - q_j||^2  (weighted by normalized confidence scores) */
+
+/***============= Pose hypothesis generation from cliques =============***/
     Eigen::Matrix4f best_est1, best_est2;
 
     bool found = false;
@@ -844,7 +890,7 @@ bool registration(const string &name, const string &src_pointcloud, const string
 
     vector<Vote>est_vector;
     vector<pair<int, vector<int>>> des_src;
-    make_des_src_pair(correspondence, des_src); //将初始匹配形成点到点集的对应
+    make_des_src_pair(correspondence, des_src); // build target->source index mapping from raw correspondences
 #pragma omp parallel for
     for (int i = 0; i < (int)total_estimate; i++)
     {
@@ -858,7 +904,7 @@ bool registration(const string &name, const string &src_pointcloud, const string
             Group.push_back(C);
             selected_index.push_back(VECTOR(*v)[j]);
         }
-        sort(selected_index.begin(), selected_index.end()); //交并前需要排序
+        sort(selected_index.begin(), selected_index.end()); // sort before union/intersection operations
 
         Eigen::Matrix4f est_trans;
         PointCloudPtr src_pts(new pcl::PointCloud<pcl::PointXYZ>);
@@ -885,10 +931,15 @@ bool registration(const string &name, const string &src_pointcloud, const string
         if (!add_overlap || instance_equal) {
             weight_vec.setOnes(); // 2023.2.23
         }
-        weight_SVD(src_pts, des_pts, weight_vec, 0, est_trans); //生成位姿变换假设
+        weight_SVD(src_pts, des_pts, weight_vec, 0, est_trans); // estimate one pose hypothesis from weighted SVD
         Group.assign(Group1.begin(), Group1.end());
         Group1.clear();
-/******************************************初步评估所有的假设***************************************************/
+/***====== PRELIMINARY HYPOTHESIS SCORING (Outlier-Aware MAE) ======***/
+/* Eq. 20-21: Score hypothesis h_k by Outlier-Aware MAE metric:
+   Score = sum_j (1/|S_p_j^t|) * sum_i phi_mae(||R_k*p_i^s + t_k - p_j^t||)
+   phi_mae(e) = max(0, 1 - e/threshold)  [linear decay, hard cutoff at threshold]
+   This prevents false transforms from accumulating high scores via duplicate targets. */
+
         float score = 0.0, score_local = 0.0;
         score = OAMAE(cloud_src_kpts, cloud_des_kpts, est_trans, des_src, inlier_thresh);
         score_local = evaluation_trans( Group, src_pts, des_pts, est_trans, inlier_thresh, metric, resolution);
@@ -898,7 +949,7 @@ bool registration(const string &name, const string &src_pointcloud, const string
         Group.clear();
         Group.shrink_to_fit();
 
-        //GT未知
+        // Gate hypotheses by geometric consistency score only (no GT needed).
         if (score > 0)
         {
 #pragma omp critical
@@ -933,7 +984,7 @@ bool registration(const string &name, const string &src_pointcloud, const string
         selected_index.shrink_to_fit();
     }
 
-    //释放内存空间
+    // Release clique storage before subsequent clustering.
     igraph_vector_int_list_destroy(&cliques);
     bool clique_reduce = false;
     vector<int>indices(est_vector.size());
@@ -948,13 +999,17 @@ bool registration(const string &name, const string &src_pointcloud, const string
     est_vector.assign(est_vector1.begin(), est_vector1.end());
     est_vector1.clear();
 
-    //先evaluate再筛选
+/***============= CLIQUE RANKING AND HYPOTHESIS FILTERING =============***/
+/* Sort hypotheses by OA-MAE score (descending).
+   Keep top K2 hypotheses before clustering (K2 ~ min(N_correspondences, N_cliques)) */
+
+    // Re-evaluate and keep only top-ranked hypotheses.
     int max_num = min(min((int)total_num, (int)total_estimate), max_est_num);
     success_num = 0;
     vector<int>remained_est_ind;
     vector<Eigen::Matrix3f> Rs_new;
     vector<Eigen::Vector3f> Ts_new;
-    if((int )est_vector.size() > max_num) { //选出排名靠前的假设
+    if((int )est_vector.size() > max_num) { // keep top-ranked hypotheses only
         cout << "too many cliques" << endl;
     }
     for(int i = 0; i < min(max_num, (int )est_vector.size()); i++){
@@ -988,7 +1043,7 @@ bool registration(const string &name, const string &src_pointcloud, const string
     //cout << success_num << " : " << max_num << " : " << total_estimate << " : " << clique_num << endl;
     //cout << min_size << " : " << max_size << " : " << selected_size << endl;
     correct_est_num = success_num;
-/******************************************聚类参数设置***************************************************/
+/****************************************** Hypothesis clustering parameters ***************************************************/
     float angle_thresh;
     float dis_thresh;
     if(name == "3dmatch" || name == "3dlomatch"){
@@ -1008,17 +1063,26 @@ bool registration(const string &name, const string &src_pointcloud, const string
         exit(-1);
     }
 
-/******************************************假设聚类***************************************************/
+/****************************************** Hypothesis clustering ***************************************************/
     pcl::IndicesClusters clusterTrans;
     pcl::PointCloud<pcl::PointXYZINormal>::Ptr trans(new pcl::PointCloud<pcl::PointXYZINormal>);
     float eigenSimilarityScore = numeric_limits<float>::max();
-    int similar2est1_cluster; //类号
-    int similar2est1_ind;//类内号
+    int similar2est1_cluster; // cluster index
+    int similar2est1_ind; // index within that cluster
     int best_index;
+
+/***============= TRANSFORMATION CLUSTERING (Euler angles + translation) =============***/
+/* Eq. 18-19: Cluster hypotheses in 6D space (3D Euler angles + 3D translation).
+   For rotation matrix R_i -> Euler angles: r_i = (atan2(r32,r33), -asin(r31), atan2(r21,r11))
+   Two hypotheses in same cluster if:
+   1) Angular distance ||r_i - r_j|| < angle_thresh AND
+   2) Translation distance ||t_i - t_j|| < dis_thresh
+   Correct transforms form dense clusters; false positives scatter.
+   Clustering also reduces memory before hypothesis evaluation. */
 
     clusterTransformationByRotation(Rs, Ts, angle_thresh, dis_thresh,  clusterTrans, trans);
     cout << "Total "<<max_num <<" cliques form "<< clusterTrans.size() << " clusters." << endl;
-    //如果聚类失败的特殊处理，退化为标准MAC算法
+    // Fallback when clustering fails: degrade to standard MAC behavior.
     if(clusterTrans.size() ==0){
         Eigen::MatrixXf tmp_best;
         if (name == "U3M")
@@ -1089,7 +1153,7 @@ bool registration(const string &name, const string &src_pointcloud, const string
         }
     }
 
-    //聚类排序,大聚类排在前面
+    // Sort clusters by size in descending order.
     int goodClusterNum = 0;
     vector<Vote>sortCluster(clusterTrans.size());
     for(int i = 0; i < (int )clusterTrans.size(); i++){
@@ -1102,8 +1166,8 @@ bool registration(const string &name, const string &src_pointcloud, const string
     assert(goodClusterNum>0);
     sort(sortCluster.begin(), sortCluster.end(), compare_vote_score);
 
-    //找出best_est1对应在哪个聚类中
-    vector<Eigen::Matrix4f,aligned_allocator<Matrix4f>> est_trans2; //内存对齐
+    // Find which cluster contains the hypothesis closest to best_est1.
+    vector<Eigen::Matrix4f,aligned_allocator<Matrix4f>> est_trans2; // aligned allocator for Eigen matrices
     vector<int>clusterIndexOfest2;
     vector<int>globalUnionInd;
 #pragma omp parallel for
@@ -1130,24 +1194,29 @@ bool registration(const string &name, const string &src_pointcloud, const string
     }
     cout << "Mat " << similar2est1_ind <<" in cluster " << similar2est1_cluster << " ("<< sortCluster[similar2est1_cluster].score << ") is similar to best_est1 with score " << eigenSimilarityScore <<endl;
 
-    //对于每个聚类生成聚类中心，类匹配
+/***====== STAGE 5B: HYPOTHESIS EVALUATION PER CLUSTER ======***/
+/* For each cluster: find center hypothesis with highest OA-MAE score.
+   Merge correspondence supports from all hypotheses in cluster (union of support sets).
+   Re-evaluate cluster on accumulated correspondence set for robustness. */
+
+    // For each cluster: choose a center and merge correspondence supports.
     vector<vector<int>>subclusterinds;
 #pragma omp parallel for
     for(int i = 0; i < (int )sortCluster.size(); i ++){
-        //考察同一聚类的匹配
+        // Process hypotheses from the same cluster.
         vector<Corre_3DMatch>subClusterCorr;
         PointCloudPtr cluster_src_pts(new pcl::PointCloud<pcl::PointXYZ>);
         PointCloudPtr cluster_des_pts(new pcl::PointCloud<pcl::PointXYZ>);
         vector<int>subUnionInd;
-        int index = sortCluster[i].index; //clusterTrans中的序号
-        int k = clusterTrans[index].indices[0]; //初始聚类中心
-        float cluster_center_score = scores[remained_est_ind[k]]; //初始聚类中心分数
+        int index = sortCluster[i].index; // index in clusterTrans
+        int k = clusterTrans[index].indices[0]; // initial cluster center
+        float cluster_center_score = scores[remained_est_ind[k]]; // initial center score
         subUnionInd.assign(group_corr_ind[remained_est_ind[k]].begin(), group_corr_ind[remained_est_ind[k]].end());
 
         for(int j = 1; j < (int )clusterTrans[index].indices.size(); j ++){
             int m = clusterTrans[index].indices[j];
-            float current_score = scores[remained_est_ind[m]]; //local score
-            if (current_score > cluster_center_score){ //分数最高的设为聚类中心
+            float current_score = scores[remained_est_ind[m]]; // local score
+            if (current_score > cluster_center_score){ // use highest-score hypothesis as cluster center
                 k = m;
                 cluster_center_score = current_score;
             }
@@ -1184,7 +1253,7 @@ bool registration(const string &name, const string &src_pointcloud, const string
     vector<pair<int, vector<int>>> des_src2;
     make_des_src_pair(globalUnionCorr, des_src2);
 
-//找出best_est2 最好的聚类中心与其对应的类
+// Find best_est2: best cluster center and its cluster id.
     best_score = 0;
 #pragma omp parallel for
     for(int i = 0; i < (int )est_trans2.size(); i++){
@@ -1205,7 +1274,7 @@ bool registration(const string &name, const string &src_pointcloud, const string
         }
     }
 
-    //按照clusterIndexOfest2 排序 subclusterinds
+    // Sort subclusterinds by clusterIndexOfest2.
     indices.clear();
     for(int i = 0; i < (int )clusterIndexOfest2.size(); i++){
         indices.push_back(i);
@@ -1219,20 +1288,26 @@ bool registration(const string &name, const string &src_pointcloud, const string
     subclusterinds.assign(subclusterinds1.begin(), subclusterinds1.end());
     subclusterinds1.clear();
 
-    //输出每个best_est分别在哪个类
+    // Report which clusters best_est1 and best_est2 come from.
     if(best_index == similar2est1_cluster){
         cout << "Both choose cluster " << best_index << endl;
     }
     else{
         cout << "best_est1: " << similar2est1_cluster << ", best_est2: " << best_index << endl;
     }
-    //sampled corr -> overlap prior batch -> TCD 确定best_est1和best_est2中最好的
+/***============= STAGE 5C: LOCAL PATCH VERIFICATION (Truncated Chamfer Distance) =============***/
+/* Both candidates (best_est1, best_est2) are validated on local patches around seed nodes.
+   Patch radius = 2 * inlier_thresh.
+   Select candidate with lower truncated Chamfer distance.
+   This two-stage selection prevents loss of correct solutions during clustering. */
+
+    // Compare best_est1 and best_est2 with TCD on sampled local patches.
     Eigen::Matrix4f best_est;
-    PointCloudPtr sampled_src(new pcl::PointCloud<pcl::PointXYZ>); // dense point cloud
+    PointCloudPtr sampled_src(new pcl::PointCloud<pcl::PointXYZ>); // denser local support cloud
     PointCloudPtr sampled_des(new pcl::PointCloud<pcl::PointXYZ>);
 
     getCorrPatch(sampled_corr, cloud_src_kpts, cloud_des_kpts, sampled_src, sampled_des, 2*inlier_thresh);
-    //点云patch后校验两个best_est
+    // Validate both best estimates on local patches.
     float score1 = trancatedChamferDistance(sampled_src, sampled_des, best_est1, inlier_thresh);
     float score2 = trancatedChamferDistance(sampled_src, sampled_des, best_est2, inlier_thresh);
     vector<Corre_3DMatch>cluster_eva_corr;
@@ -1240,19 +1315,19 @@ bool registration(const string &name, const string &src_pointcloud, const string
     PointCloudPtr cluster_eva_corr_des(new pcl::PointCloud<pcl::PointXYZ>);
     cout << "best_est1: " << score1 << ", best_est2: " << score2 << endl;
 
-    // cluster_internal_evaluation
+    // Optional internal cluster evaluation/refinement.
     if(cluster_internal_eva){
-        if(eigenSimilarityScore < 0.1){ //best_est1在聚类中
-            if(score1 > score2) { //best_est1好的情况
+        if(eigenSimilarityScore < 0.1){ // best_est1 is represented by one cluster
+            if(score1 > score2) { // best_est1 branch
                 best_index = similar2est1_cluster;
                 best_est = best_est1;
                 cout << "prior is better" << endl;
             }
-            else { //best_est2好的情况
+            else { // best_est2 branch
                 best_est = best_est2;
                 cout << "post is better" << endl;
             }
-            //取匹配交集
+            // Keep only the overlap between sampled seeds and selected cluster correspondences.
             vector<int>cluster_eva_corr_ind;
             cluster_eva_corr_ind.assign(subclusterinds[best_index].begin(), subclusterinds[best_index].end());
             sort(cluster_eva_corr_ind.begin(), cluster_eva_corr_ind.end());
@@ -1271,7 +1346,7 @@ bool registration(const string &name, const string &src_pointcloud, const string
                     num++;
                 }
             }
-            //这里的内点率要比seed内点率高
+            // The inlier ratio here should exceed that of the seed set.
             cout << cluster_eva_corr_ind.size() << " intersection correspondences have " << num << " inlies: "<< num / ((int)cluster_eva_corr_ind.size() / 1.0) * 100 << "%" << endl;
             vector<pair<int, vector<int>>> des_src3;
             make_des_src_pair(cluster_eva_corr, des_src3);
@@ -1282,8 +1357,8 @@ bool registration(const string &name, const string &src_pointcloud, const string
                 best_est = clusterInternalTransEva1(clusterTrans, best_index, best_est, Rs, Ts, cloud_src_kpts, cloud_des_kpts, des_src3, inlier_thresh, GTmat, false, folderPath);
             }
         }
-        else{ //best_est1不在聚类中
-            if(score2 > score1){ //best_est2好的情况
+        else{ // best_est1 is not represented by the clustered set
+            if(score2 > score1){ // best_est2 branch
                 best_est = best_est2;
                 cout << "post is better" << endl;
                 vector<int>cluster_eva_corr_ind;
@@ -1308,11 +1383,11 @@ bool registration(const string &name, const string &src_pointcloud, const string
                 vector<pair<int, vector<int>>> des_src3;
                 make_des_src_pair(cluster_eva_corr, des_src3);
                 best_est = clusterInternalTransEva1(clusterTrans, best_index, best_est, Rs, Ts, cloud_src_kpts, cloud_des_kpts, des_src3, inlier_thresh, GTmat, false, folderPath);
-                //1tok
+                // _1tok path can be re-enabled here if needed.
                 //best_est = clusterInternalTransEva1(clusterTrans, best_index, best_est, Rs, Ts, cloud_src_kpts, cloud_des_kpts, des_src3, inlier_thresh, GTmat, folderPath);
             }
-            else{ //仅优化best_est1
-                best_index = -1; //不存在类中
+            else{ // refine best_est1 only
+                best_index = -1; // not contained in any cluster
                 best_est = best_est1;
                 cout << "prior is better but not in cluster! Refine est1" <<endl;
             }
@@ -1322,11 +1397,25 @@ bool registration(const string &name, const string &src_pointcloud, const string
         best_est = score1 > score2 ? best_est1 : best_est2;
     }
 
+/***================ FINAL RESULT SELECTION AND OUTPUT ================***/
+/* Select final transformation estimate T = [R | t; 0 0 0 1] based on:
+   1) Two-stage cluster candidate selection (largest cluster center vs global best)
+   2) Local patch verification using truncated Chamfer distance
+   3) Internal refinement within winning cluster (if enabled)
+   Output includes: final transformation matrix, evaluation metrics (RE, TE), logs */
+
     end = std::chrono::system_clock::now();
     elapsed_time = end - start;
     time_epoch += std::chrono::duration_cast<std::chrono::milliseconds>(elapsed_time).count();
     time_number[3] =  elapsed_time.count();
     cout << " post evaluation: " << elapsed_time.count() << endl;
+
+/***================== FINAL RESULT SELECTION AND OUTPUT ====================***/
+/* Select the final transformation estimate based on:
+   1) Cluster size and rank
+   2) OA-MAE score within cluster
+   3) Local patch verification result
+   Output final 4x4 transformation matrix T = [R | t; 0 0 0 1] */
 
     Eigen::Matrix4f tmp_best;
     if (name == "U3M")
@@ -1370,10 +1459,10 @@ bool registration(const string &name, const string &src_pointcloud, const string
         pred_inlier.push_back(IR);
         pred_inlier.push_back(F1);
 
-        //ICP
+        // Optional ICP refinement.
         if(use_icp){
             pcl::IterativeClosestPoint<pcl::PointXYZ, pcl::PointXYZ> icp;
-            icp.setInputSource(cloud_src_kpts); //稀疏一些耗时小
+            icp.setInputSource(cloud_src_kpts); // sparse source points are faster
             icp.setInputTarget(cloud_des);
             icp.setMaxCorrespondenceDistance(0.05);
             icp.setTransformationEpsilon(1e-10);
@@ -1392,7 +1481,7 @@ bool registration(const string &name, const string &src_pointcloud, const string
     }
 
     if(!no_logs){
-        //保存匹配到txt
+        // Save estimated transform (and optionally correspondence dumps) to disk.
         //savetxt(correspondence, folderPath + "/corr.txt");
         //savetxt(selected, folderPath + "/selected.txt");
         string save_est = folderPath + "/est.txt";
@@ -1405,7 +1494,7 @@ bool registration(const string &name, const string &src_pointcloud, const string
         //string save_label = folderPath + "/label.txt";
         //CopyFile(label_path.c_str(), save_label.c_str(), false);
 
-        //保存ply
+        // Optional: save source/target clouds if needed for visualization.
         //string save_src_cloud = folderPath + "/source.ply";
         //string save_tgt_cloud = folderPath + "/target.ply";
         //CopyFile(src_pointcloud.c_str(), save_src_cloud.c_str(), false);
@@ -1415,7 +1504,7 @@ bool registration(const string &name, const string &src_pointcloud, const string
     int pid = getpid();
     mem_epoch = getPidMemory(pid);
 
-    //保存聚类信息
+    // Save cluster diagnostics for downstream analysis.
     string analyse_csv = folderPath + "/cluster.csv";
     string correct_csv = folderPath + "/cluster_correct.csv";
     string selected_csv = folderPath + "/cluster_selected.csv";
@@ -1574,7 +1663,7 @@ int main(int argc, char** argv){
     if (access(folderPath.c_str(), 0))
     {
         if (mkdir(folderPath.c_str(),S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH) != 0) {
-            cout << " 创建数据项目录失败 " << endl;
+            cout << " failed to create output data directory " << endl;
             exit(-1);
         }
     }
